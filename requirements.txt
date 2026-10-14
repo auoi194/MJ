@@ -6,7 +6,7 @@ uvicorn[standard]>=0.27.0
 httpx>=0.26.0
 python-dotenv>=1.0.0
 
-# --- existing MJ project ---
+# --- ของโปรเจค MJ เดิม ---
 cloudscraper==1.2.71
 certifi==2024.7.4
 dnspython==2.6.1
